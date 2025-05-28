@@ -33,3 +33,15 @@ services:
       - ./spark:/opt/spark-app
       - ./data:/opt/data
     command: bash
+
+  mongo:
+    image: mongo
+    container_name: mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+
+volumes:
+  mongo-data:
