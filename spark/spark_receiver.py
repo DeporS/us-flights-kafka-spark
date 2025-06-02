@@ -2,12 +2,18 @@ from pyspark.sql import SparkSession
 from pyspark.sql.functions import from_json, col, expr, window, to_timestamp, count, sum, when, to_date, length, split, lpad, concat_ws, lit, coalesce, lower, unix_timestamp, broadcast
 from pyspark.sql.types import *
 from spark_helper import hhmm_to_timestamp
+from datetime import timedelta
 import sys
 
 # For anomalies detection
 D_MINUTES_DEFAULT = 60
 # Number of airplanes mid air
 N_THRESHOLD_DEFAULT = 30
+
+MONGO_URI = "mongodb://localhost:27017"
+FLIGHT_DATABASE = "flight_data"
+ETL_COLLECTION = "daily_state_aggregates"
+ANOMALY_COLLECTION = "flight_anomalies"
 
 AIRPORTS_CSV_PATH = "data/airports.csv"
 
@@ -97,7 +103,8 @@ raw_kafka_stream = spark.readStream \
     .format("kafka") \
     .option("kafka.bootstrap.servers", "localhost:9092") \
     .option("subscribe", "flights") \
-    .option("startingOffsets", "earliest") \
+    .option("startingOffsets", "latest") \
+    .option("failOnDataLoss", "false") \
     .load()
 
 # Deserialize Kafka message
@@ -110,19 +117,6 @@ parsed_stream_df = csv_stream_df.select(data_parts) \
 
 # filter first verse:
 filtered_stream_df = parsed_stream_df.filter(lower(col("airline")) != "airline")
-
-def create_timestamp_str(year, month, day, time_hhmm):
-    # fix time format HHmm (ex. '5' -> '0005', '930' -> '0930')
-    padded_time = lpad(time_hhmm, 4, '0')
-    hour = padded_time.substr(1, 2)
-    minute = padded_time.substr(3, 2)
-    
-    safe_hour = when(hour == "24", "00").otherwise(hour)
-    
-    return concat_ws(" ",
-        concat_ws("-", year, lpad(month, 2, "0"), lpad(day, 2, "0")),
-        concat_ws(":", safe_hour, minute, lit("00")) # add seconds
-    )
 
 
 # Base event timestamp from orderColumn and derived timestamps
@@ -183,26 +177,26 @@ departures_for_union = watermarked_df \
     .select(
         col("flight_date"),
         col("origin_airports.airport_state").alias("state"),
-        col("departure_delay_minutes").alias("delay_value"), # Ogólna nazwa dla opóźnienia
+        col("departure_delay_minutes").alias("delay_value"), # name for delay
         lit("departure").alias("event_type"),
-        col("event_timestamp") # Zachowaj dla potencjalnego watermark na połączonym strumieniu
+        col("event_timestamp") # keep for potential watermark
     ) \
     .filter(col("state").isNotNull())
 
-# Przygotuj dane o przylotach do unii
+# Arrivals processing
 arrivals_for_union = watermarked_df \
     .filter(col("infoType") == "A") \
     .join(broadcast(df_airports.alias("dest_airports")), col("destAirport") == col("dest_airports.airport_iata"), "left_outer") \
     .select(
         col("flight_date"),
         col("dest_airports.airport_state").alias("state"),
-        col("arrival_delay_minutes").alias("delay_value"), # Ogólna nazwa dla opóźnienia
+        col("arrival_delay_minutes").alias("delay_value"), # name for delay
         lit("arrival").alias("event_type"),
-        col("event_timestamp") # Zachowaj dla potencjalnego watermark na połączonym strumieniu
+        col("event_timestamp") # keep for potential watermark
     ) \
     .filter(col("state").isNotNull())
 
-unioned_events_df = departures_for_union.unionByName(arrivals_for_union, allowMissingColumns=True) # allowMissingColumns=True na wszelki wypadek, choć schematy powinny pasować
+unioned_events_df = departures_for_union.unionByName(arrivals_for_union, allowMissingColumns=True) # allowMissingColumns=True just in case
 
 
 final_etl_agg = unioned_events_df \
@@ -214,6 +208,7 @@ final_etl_agg = unioned_events_df \
         sum(when((col("event_type") == "arrival") & (col("delay_value") > 0), col("delay_value")).otherwise(lit(0.0))).alias("total_positive_arrival_delay")
     )
 
+# Console output
 etl_query_combined = final_etl_agg.writeStream \
     .outputMode("update") \
     .format("console") \
@@ -222,6 +217,20 @@ etl_query_combined = final_etl_agg.writeStream \
     .queryName("ETL_Combined_Realtime_V2") \
     .start()
 
+# Save agregated ETL to MongoDB
+# try:
+#     etl_query_to_mongo = final_etl_agg.writeStream \
+#         .outputMode("append") \
+#         .format("mongodb") \
+#         .option("checkpointLocation", "/tmp/spark_checkpoints/etl_mongodb") \
+#         .option("connection.uri", MONGO_URI) \
+#         .option("database", FLIGHT_DATABASE) \
+#         .option("collection", ETL_COLLECTION) \
+#         .queryName("ETL_To_MongoDB") \
+#         .start()
+#     print(f"Batch written to MongoDB.")
+# except Exception as e:
+#     print(f"Error writing batch to MongoDB")
 
 anomaly_input_df = watermarked_df \
     .filter(col("infoType") == "D") \
@@ -235,14 +244,21 @@ anomaly_input_df = watermarked_df \
     )
 
 
-# The anomaly detection runs every 10 minutes of processing time.
+# The anomaly detection
 # Inside each batch, it calculates the future window.
 def process_anomaly_batch(batch_df, batch_id):
     print(f"--- Anomaly Detection Batch ID: {batch_id} ---")
-    current_proc_time = spark.sql("SELECT current_timestamp() as now").collect()[0]['now']
-    
-    anomaly_window_start = current_proc_time + expr(f"INTERVAL 30 MINUTES")
-    anomaly_window_end = anomaly_window_start + expr(f"INTERVAL {D_MINUTES} MINUTES")
+
+    if batch_df.rdd.isEmpty(): 
+        print(f"Batch DF for Anomaly Detection (ID: {batch_id}) is empty. Skipping anomaly check for this batch.")
+        return
+
+    #current_proc_time = spark.sql("SELECT current_timestamp() as now").collect()[0]['now']
+    mock_time_row = batch_df.selectExpr("max(event_timestamp) as mock_current_time").first()
+    current_proc_time = mock_time_row["mock_current_time"]
+
+    anomaly_window_start = current_proc_time + timedelta(minutes=30)
+    anomaly_window_end = anomaly_window_start + timedelta(minutes=D_MINUTES)
 
     print(f"Anomaly Scan Window: {anomaly_window_start} to {anomaly_window_end}")
 
@@ -259,8 +275,8 @@ def process_anomaly_batch(batch_df, batch_id):
         .groupBy("destAirport") \
         .agg(count("*").alias("planes_in_window"))
 
-    # Total flights heading to any airport (in this batch, not just window)
-    # This provides context: "liczbę wszystkich samolotów lecących do lotniska"
+    # Total flights heading to an airport (in this batch, not just window)
+    # This provides context: "liczba wszystkich samolotów lecących do lotniska"
     # Interpretation: "all aircraft in the current stream batch data that are scheduled to arrive at this airport eventually"
     total_flights_to_airport_in_batch = batch_df \
         .groupBy("destAirport") \
@@ -285,13 +301,27 @@ def process_anomaly_batch(batch_df, batch_id):
     if not potential_anomalies.rdd.isEmpty():
         print(f"ANOMALIES DETECTED (Batch ID: {batch_id}):")
         potential_anomalies.show(truncate=False)
+
+        # Save anomalies to MongoDB
+        # try:
+        #     potential_anomalies.write \
+        #         .format("mongodb") \
+        #         .mode("append") \
+        #         .option("connection.uri", MONGO_URI) \
+        #         .option("database", FLIGHT_DATABASE) \
+        #         .option("collection", ANOMALY_COLLECTION) \
+        #         .save()
+        #     print(f"Anomalies from Batch ID: {batch_id} written to MongoDB.")
+        # except Exception as e:
+        #     print(f"Error writing anomalies to MongoDB for Batch ID: {batch_id}: {e}")
+
     else:
         print(f"No anomalies detected in this interval (Batch ID: {batch_id}).")
 
 # Anomaly Detection Stream (using foreachBatch for dynamic window calculation)
 anomaly_query = anomaly_input_df.writeStream \
     .foreachBatch(process_anomaly_batch) \
-    .trigger(processingTime="10 minutes") \
+    .trigger(processingTime="30 seconds") \
     .outputMode("update") \
     .queryName("Anomaly_Detection_Realtime") \
     .start()
