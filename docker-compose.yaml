@@ -17,37 +17,60 @@ services:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
 
-  spark:
-    image: bitnami/spark:3.5
+  producer:
+    build: ./kafka
+    volumes:
+      - ./data/flights:/data/flights
     depends_on:
       - kafka
-      - mongo
     environment:
-      SPARK_MODE: master
-      HOME: /tmp
-    volumes:
-      - ./spark:/opt/spark-app
-      - ./data:/opt/data
-    command: tail -f /dev/null
+      PYTHONUNBUFFERED: 1
 
-  mongo:
-    image: mongo
-    container_name: mongo
-    restart: unless-stopped
+  spark:
+    image: bitnami/spark:3.5.1
+    container_name: spark
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    environment:
+      - SPARK_MODE=driver
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    volumes:
+      - ./spark:/opt/spark
+      - ./data:/opt/data
+    depends_on:
+      - producer
+      - kafka
+      - mongodb
+    ports:
+      - "4040:4040"
+    command:
+      [
+        "spark-submit",
+        "--conf",
+        "spark.jars.ivy=/tmp/.ivy2",
+        "--packages",
+        "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,org.mongodb.spark:mongo-spark-connector_2.12:10.4.0", # packages
+        "/opt/spark/spark_receiver.py",
+        "60",
+        "1"
+      ]
+
+  mongodb:
+    image: mongo:6.0
+    container_name: mongodb
     ports:
       - "27017:27017"
     volumes:
       - mongo-data:/data/db
-    healthcheck:
-      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
+    restart: unless-stopped
 
 volumes:
   mongo-data:

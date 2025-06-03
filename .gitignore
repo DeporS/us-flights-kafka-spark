@@ -1,2 +1,5 @@
-data/
+data/flights/*
+!data/flights/part-00000-7c49e01f-d680-4b7d-abcb-749f8a998ba2-c000.csv
 venv/
+__pycache__/
+*.pyc

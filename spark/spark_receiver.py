@@ -1,8 +1,9 @@
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import from_json, col, expr, window, to_timestamp, count, sum, when, to_date, length, split, lpad, concat_ws, lit, coalesce, lower, unix_timestamp, broadcast
 from pyspark.sql.types import *
-from spark_helper import hhmm_to_timestamp
+from pymongo import MongoClient
 from datetime import timedelta
+import datetime
 import sys
 
 # For anomalies detection
@@ -10,18 +11,18 @@ D_MINUTES_DEFAULT = 60
 # Number of airplanes mid air
 N_THRESHOLD_DEFAULT = 30
 
-MONGO_URI = "mongodb://localhost:27017"
+MONGO_URI = "mongodb://mongodb:27017"
 FLIGHT_DATABASE = "flight_data"
 ETL_COLLECTION = "daily_state_aggregates"
 ANOMALY_COLLECTION = "flight_anomalies"
 
-AIRPORTS_CSV_PATH = "data/airports.csv"
+AIRPORTS_CSV_PATH = "/opt/data/airports.csv"
 
 spark = SparkSession.builder \
     .appName("FlightETL") \
     .getOrCreate()
 
-spark.sparkContext.setLogLevel("WARN")
+spark.sparkContext.setLogLevel("ERROR")
 
 # Configuration for Anomaly Detection
 try:
@@ -101,7 +102,7 @@ flight_event_schema = StructType([
 # Read from Kafka
 raw_kafka_stream = spark.readStream \
     .format("kafka") \
-    .option("kafka.bootstrap.servers", "localhost:9092") \
+    .option("kafka.bootstrap.servers", "kafka:9092") \
     .option("subscribe", "flights") \
     .option("startingOffsets", "latest") \
     .option("failOnDataLoss", "false") \
@@ -218,6 +219,46 @@ etl_query_combined = final_etl_agg.writeStream \
     .start()
 
 # Save agregated ETL to MongoDB
+def write_to_mongo_upsert(df, batch_id):
+    # Connect with mongodb
+    client = MongoClient(MONGO_URI)
+    db = client[FLIGHT_DATABASE]
+    collection = db[ETL_COLLECTION]
+
+    # Convert spark df to pandas
+    pandas_df = df.toPandas()
+
+    for _, row in pandas_df.iterrows():
+        # Filter values to update
+        flight_date = row["flight_date"]
+        if isinstance(flight_date, datetime.date) and not isinstance(flight_date, datetime.datetime):
+            flight_date = datetime.datetime(flight_date.year, flight_date.month, flight_date.day)
+
+        # Filter values to update
+        filter_ = {"flight_date": flight_date, "state": row["state"]}
+
+        # Data for update
+        update = {
+            "$set": {
+                "departure_count": row["departure_count"],
+                "total_positive_departure_delay": row["total_positive_departure_delay"],
+                "arrival_count": row["arrival_count"],
+                "total_positive_arrival_delay": row["total_positive_arrival_delay"]
+            }
+        }
+
+        # upsert - update if exists, else insert
+        collection.update_one(filter_, update, upsert=True)
+
+    client.close()
+
+
+etl_query_to_mongo = final_etl_agg.writeStream \
+    .outputMode("update") \
+    .foreachBatch(write_to_mongo_upsert) \
+    .option("checkpointLocation", "/tmp/spark_checkpoints/etl_mongodb") \
+    .start()
+
 # try:
 #     etl_query_to_mongo = final_etl_agg.writeStream \
 #         .outputMode("append") \
@@ -303,22 +344,23 @@ def process_anomaly_batch(batch_df, batch_id):
         potential_anomalies.show(truncate=False)
 
         # Save anomalies to MongoDB
-        # try:
-        #     potential_anomalies.write \
-        #         .format("mongodb") \
-        #         .mode("append") \
-        #         .option("connection.uri", MONGO_URI) \
-        #         .option("database", FLIGHT_DATABASE) \
-        #         .option("collection", ANOMALY_COLLECTION) \
-        #         .save()
-        #     print(f"Anomalies from Batch ID: {batch_id} written to MongoDB.")
-        # except Exception as e:
-        #     print(f"Error writing anomalies to MongoDB for Batch ID: {batch_id}: {e}")
+        try:
+            potential_anomalies.write \
+                .format("mongodb") \
+                .mode("append") \
+                .option("connection.uri", MONGO_URI) \
+                .option("database", FLIGHT_DATABASE) \
+                .option("collection", ANOMALY_COLLECTION) \
+                .save()
+            print(f"Anomalies from Batch ID: {batch_id} written to MongoDB.")
+        except Exception as e:
+            print(f"Error writing anomalies to MongoDB for Batch ID: {batch_id}: {e}")
 
     else:
         print(f"No anomalies detected in this interval (Batch ID: {batch_id}).")
 
 # Anomaly Detection Stream (using foreachBatch for dynamic window calculation)
+# Change processingTime to change anomalies detection time
 anomaly_query = anomaly_input_df.writeStream \
     .foreachBatch(process_anomaly_batch) \
     .trigger(processingTime="30 seconds") \

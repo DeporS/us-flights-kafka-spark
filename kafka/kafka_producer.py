@@ -4,7 +4,7 @@ import os
 
 try:
     producer = KafkaProducer(
-        bootstrap_servers=['localhost:9092']
+        bootstrap_servers=['kafka:9092']
     )
 except Exception as e:
     print("Kafka not reachable:", e)

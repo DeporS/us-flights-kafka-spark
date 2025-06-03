@@ -1,13 +1,42 @@
-# us-flights-kafka-spark
+# Instrukcja uruchomienia projektu
 
-python3 -m venv venv ; source venv/bin/activate
+## Krok 1: Uruchomienie środowiska Kafka i MongoDB (terminal 1)
 
-chmod +x reset_kafka.sh
-chmod +x ./spark/spark_receiver.py
+```bash
+docker compose up zookeeper kafka producer mongodb
+```
 
-spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.13:3.5.1,org.mongodb.spark:mongo-spark-connector_2.13:10.2.1 spark/spark_receiver.py 60 1
+Poczekaj aż zobaczysz utworzenie nowego tematu Kafki, oraz wyświetlane wiadomości wysyłane przez producenta.
 
-spark-submit \
-  --conf spark.jars.ivy=/tmp/.ivy2 \
-  --packages org.apache.spark:spark-sql-kafka-0-10_2.13:3.5.1,org.mongodb.spark:mongo-spark-connector_2.13:10.2.1 \
-  /opt/spark/spark_receiver.py 60 1
+## Krok 2: Uruchomienie Spark (terminal 2)
+
+```bash
+docker compose up spark
+```
+
+## Krok 3: Sprawdzanie danych w MongoDB (terminal 3)
+
+1. Wejdź do kontenera MongoDB:
+
+```bash
+docker exec -it mongodb bash
+```
+
+2. Uruchom powłokę MongoDB:
+
+```bash
+mongosh
+```
+
+3. Wybierz bazę danych:
+
+```js
+use flight_data
+```
+
+4. Wyświetl dane z kolekcji:
+
+```js
+db.flight_anomalies.find().pretty()
+db.daily_state_aggregates.find().pretty()
+```
