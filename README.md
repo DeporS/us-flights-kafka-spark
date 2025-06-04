@@ -1,5 +1,12 @@
 # Instrukcja uruchomienia projektu
 
+## Krok 0: Przygotowanie danych
+
+W głównym katalogu projektu utwórz folder `data`. W nim umieść:
+
+- plik `airports.csv`
+- folder `flights`, zawierający dane z lotów (pliki `.csv`)
+
 ## Krok 1: Uruchomienie środowiska Kafka i MongoDB (terminal 1)
 
 ```bash
@@ -40,3 +47,6 @@ use flight_data
 db.flight_anomalies.find().pretty()
 db.daily_state_aggregates.find().pretty()
 ```
+
+Dla zadanych parametrów wykrywania anomalii, mogą one występować bardzo rzadko, więc kolekcja `flight_anomalies` może być pusta.
+

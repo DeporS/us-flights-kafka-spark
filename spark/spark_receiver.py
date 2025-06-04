@@ -363,7 +363,7 @@ def process_anomaly_batch(batch_df, batch_id):
 # Change processingTime to change anomalies detection time
 anomaly_query = anomaly_input_df.writeStream \
     .foreachBatch(process_anomaly_batch) \
-    .trigger(processingTime="30 seconds") \
+    .trigger(processingTime="10 minutes") \
     .outputMode("update") \
     .queryName("Anomaly_Detection_Realtime") \
     .start()
